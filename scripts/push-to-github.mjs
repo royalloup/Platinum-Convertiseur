@@ -61,28 +61,41 @@ async function main() {
   console.log(`Found ${files.length} files to push`);
 
   console.log("Bootstrapping empty repo with initial file...");
-  await gh("PUT", `/repos/${OWNER}/${REPO}/contents/.bootstrap`, {
-    message: "init",
-    content: Buffer.from("init").toString("base64"),
-    branch: BRANCH,
-  });
+  try {
+    await gh("PUT", `/repos/${OWNER}/${REPO}/contents/.bootstrap`, {
+      message: "init",
+      content: Buffer.from("init").toString("base64"),
+      branch: BRANCH,
+    });
+  } catch (err) {
+    if (!String(err).includes("already exists") && !String(err).includes("422")) {
+      throw err;
+    }
+    console.log("  (already bootstrapped)");
+  }
 
-  console.log("Creating blobs...");
+  console.log("Creating blobs (parallel batches)...");
   const tree = [];
-  let i = 0;
-  for (const f of files) {
-    i++;
+  const CONCURRENCY = 12;
+  let done = 0;
+  async function uploadOne(f) {
     const buf = await fs.readFile(f);
     if (buf.length > 50 * 1024 * 1024) {
       console.log(`  [skip too big] ${f} (${buf.length} bytes)`);
-      continue;
+      return null;
     }
     const blob = await gh("POST", `/repos/${OWNER}/${REPO}/git/blobs`, {
       content: buf.toString("base64"),
       encoding: "base64",
     });
-    tree.push({ path: f.split(path.sep).join("/"), mode: "100644", type: "blob", sha: blob.sha });
-    if (i % 25 === 0 || i === files.length) console.log(`  blob ${i}/${files.length}`);
+    return { path: f.split(path.sep).join("/"), mode: "100644", type: "blob", sha: blob.sha };
+  }
+  for (let i = 0; i < files.length; i += CONCURRENCY) {
+    const batch = files.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(batch.map(uploadOne));
+    for (const r of results) if (r) tree.push(r);
+    done += batch.length;
+    console.log(`  blob ${done}/${files.length}`);
   }
 
   console.log("Creating tree...");
